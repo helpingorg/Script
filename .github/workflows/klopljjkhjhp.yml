@@ -1,0 +1,395 @@
+name: RDP + Tailscale + Dev Environment (macOS) + admin access full 
+
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: "Hostname for this RDP instance (e.g. myserver, dev-machine)"
+        required: true
+        default: "bullet"
+      ts_tailnet:
+        description: "Tailscale tailnet (e.g. you@gmail.com)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key (device admin, no Bearer)"
+        required: true
+      ts_authkey:
+        description: "Tailscale Auth key (reusable or ephemeral)"
+        required: true
+      quick_test:
+        description: "Run 5-minute test"
+        type: boolean
+        default: false
+      runtime_minutes:
+        description: "Runtime (max 360; default 355)"
+        default: "355"
+      do_purge:
+        description: "Purge matching hostname devices at start"
+        default: "true"
+      rdp_count:
+        description: "How many RDP instances (1-10)"
+        default: "1"
+      rdp_username:
+        description: "RDP Username (default: bulletuser)"
+        default: "bulletuser"
+      rdp_password:
+        description: "RDP Password (default: Bullet@12345)"
+        default: "Bullet@12345"
+      vnc_password:
+        description: "VNC Password (max 8 chars, default: vnc12345)"
+        default: "vnc12345"
+      bonsai_api_key:
+        description: "Bonsai API Key (optional, for Claude Code)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - name: Generate matrix
+        id: mk
+        run: |
+          n=${{ inputs.rdp_count }}
+          if [ "$n" -lt 1 ]; then n=1; fi
+          if [ "$n" -gt 10 ]; then n=10; fi
+          include="["
+          for i in $(seq 1 $n); do
+            if [ $i -gt 1 ]; then include+=","; fi
+            include+="{\"id\": $i}"
+          done
+          include+="]"
+          echo "matrix={\"include\":$include}" >> $GITHUB_OUTPUT
+          echo "Matrix: $include"
+
+  purge-devices:
+    runs-on: ubuntu-latest
+    needs: setup
+    if: ${{ inputs.do_purge == 'true' }}
+    steps:
+      - name: Purge old devices matching hostname
+        env:
+          TS_TAILNET: ${{ inputs.ts_tailnet }}
+          TS_API_KEY: ${{ inputs.ts_api_key }}
+          HOSTNAME_INPUT: ${{ inputs.hostname }}
+        run: |
+          hostname_pattern="${HOSTNAME_INPUT:-bullet}"
+          devices=$(curl -s -H "Authorization: Bearer $TS_API_KEY" "https://api.tailscale.com/api/v2/tailnet/$TS_TAILNET/devices")
+          echo "$devices" | jq -r ".devices[] | select(.hostname | contains(\"$hostname_pattern\")) | .id" | while read device_id; do
+            if [ -n "$device_id" ]; then
+              echo "Deleting device: $device_id"
+              curl -s -X DELETE -H "Authorization: Bearer $TS_API_KEY" "https://api.tailscale.com/api/v2/device/$device_id"
+            fi
+          done
+
+  rdp:
+    needs: [setup, purge-devices]
+    if: always() && needs.setup.result == 'success'
+    runs-on: macos-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      max-parallel: 10
+      fail-fast: false
+    timeout-minutes: 370
+
+    env:
+      RDP_USER: ${{ inputs.rdp_username }}
+      RDP_PASS: ${{ inputs.rdp_password }}
+      VNC_PASS: ${{ inputs.vnc_password }}
+
+    steps:
+      - name: Set hostname + runtime
+        run: |
+          hostname="${{ inputs.hostname }}"
+          if [ -z "$hostname" ]; then
+            rdp_count=${{ inputs.rdp_count }}
+            if [ "$rdp_count" -gt 1 ]; then
+              hostname="bullet${{ matrix.id }}"
+            else
+              hostname="bullet"
+            fi
+          fi
+          echo "TS_HOSTNAME=$hostname" >> $GITHUB_ENV
+          echo "Hostname: $hostname"
+          runtime=${{ inputs.runtime_minutes }}
+          if [ "${{ inputs.quick_test }}" = "true" ]; then
+            runtime=5
+          fi
+          if [ "$runtime" -lt 1 ]; then runtime=355; fi
+          if [ "$runtime" -gt 360 ]; then runtime=355; fi
+          echo "RUNTIME_MINUTES=$runtime" >> $GITHUB_ENV
+          echo "Runtime: $runtime minutes"
+
+      - name: Install Tailscale
+        run: |
+          brew install tailscale
+          brew link --force tailscale
+          echo "/opt/homebrew/bin" >> $GITHUB_PATH
+          export PATH="/opt/homebrew/bin:$PATH"
+          echo "Tailscale installed"
+          which tailscale
+          tailscale version
+
+      - name: Connect Tailscale
+        env:
+          TS_AUTHKEY: ${{ inputs.ts_authkey }}
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          TAILSDAEMON=$(find /opt/homebrew -name "tailscaled" -type f 2>/dev/null | head -1)
+          if [ -n "$TAILSDAEMON" ] && [ -x "$TAILSDAEMON" ]; then
+            sudo "$TAILSDAEMON" 2>/dev/null &
+          elif command -v tailscaled &>/dev/null; then
+            sudo tailscaled 2>/dev/null &
+          else
+            sudo /opt/homebrew/opt/tailscale/bin/tailscaled 2>/dev/null &
+          fi
+          sleep 3
+          sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" --accept-dns --accept-routes
+          sleep 10
+          TS_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "Tailscale IP: $TS_IP"
+
+      - name: Install Homebrew Packages
+        run: |
+          brew update
+          brew install git wget vim nano htop neofetch jq node@22
+          echo "/opt/homebrew/opt/node@22/bin" >> $GITHUB_PATH
+          echo "/opt/homebrew/bin" >> $GITHUB_PATH
+          echo "============================================"
+          echo "Homebrew packages installed!"
+          echo "============================================"
+
+      - name: Create User with FULL ADMIN Access
+        run: |
+          USER_HOME="/Users/$RDP_USER"
+          
+          if id "$RDP_USER" &>/dev/null; then
+            echo "User $RDP_USER already exists"
+          else
+            sudo sysadminctl -addUser "$RDP_USER" -password "$RDP_PASS" -admin 2>&1 || true
+            echo "Created user: $RDP_USER"
+          fi
+          
+          # Add to ALL admin groups
+          sudo dscl . append /Groups/admin GroupMembership "$RDP_USER" 2>/dev/null || true
+          sudo dscl . append /Groups/wheel GroupMembership "$RDP_USER" 2>/dev/null || true
+          sudo dscl . append /Groups/localaccounts GroupMembership "$RDP_USER" 2>/dev/null || true
+          sudo dscl . append /Groups/_developer GroupMembership "$RDP_USER" 2>/dev/null || true
+          sudo dscl . append /Groups/_appserverusr GroupMembership "$RDP_USER" 2>/dev/null || true
+          sudo dscl . append /Groups/_appserveradm GroupMembership "$RDP_USER" 2>/dev/null || true
+          sudo dscl . append /Groups/com.apple.access_ssh GroupMembership "$RDP_USER" 2>/dev/null || true
+          sudo dscl . append /Groups/com.apple.access_screensharing GroupMembership "$RDP_USER" 2>/dev/null || true
+          sudo dscl . append /Groups/com.apple.access_ftp GroupMembership "$RDP_USER" 2>/dev/null || true
+          sudo dscl . append /Groups/_lpadmin GroupMembership "$RDP_USER" 2>/dev/null || true
+          
+          # Grant Secure Token
+          sudo sysadminctl -secureTokenOn "$RDP_USER" -password "$RDP_PASS" 2>/dev/null || true
+          
+          # Enable passwordless sudo
+          echo "$RDP_USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/$RDP_USER
+          sudo chmod 440 /etc/sudoers.d/$RDP_USER
+          
+          # Grant Full Disk Access via TCC database
+          TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+          if [ -f "$TCC_DB" ]; then
+            sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access VALUES('kTCCServiceSystemPolicyAllFiles','/Users/$RDP_USER',0,1,0,NULL,NULL,NULL,'UNUSED',NULL,0,0);" 2>/dev/null || true
+            sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access VALUES('kTCCServiceSystemPolicyAllFiles','/System/Applications/Utilities/Terminal.app',0,1,0,NULL,NULL,NULL,'UNUSED',NULL,0,0);" 2>/dev/null || true
+            sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access VALUES('kTCCServiceSystemPolicyAllFiles','/bin/zsh',0,1,0,NULL,NULL,NULL,'UNUSED',NULL,0,0);" 2>/dev/null || true
+            sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access VALUES('kTCCServiceSystemPolicyAllFiles','/bin/bash',0,1,0,NULL,NULL,NULL,'UNUSED',NULL,0,0);" 2>/dev/null || true
+            sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access VALUES('kTCCServiceAccessibility','/Users/$RDP_USER',0,1,0,NULL,NULL,NULL,'UNUSED',NULL,0,0);" 2>/dev/null || true
+            sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','/Users/$RDP_USER',0,1,0,NULL,NULL,NULL,'UNUSED',NULL,0,0);" 2>/dev/null || true
+            sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access VALUES('kTCCServiceDeveloperTool','/Users/$RDP_USER',0,1,0,NULL,NULL,NULL,'UNUSED',NULL,0,0);" 2>/dev/null || true
+            sudo killall tccd 2>/dev/null || true
+          fi
+          
+          # Create .zshrc with full brew and npm access
+          echo '# Homebrew' | sudo tee "$USER_HOME/.zshrc"
+          echo 'eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"' | sudo tee -a "$USER_HOME/.zshrc"
+          echo '' | sudo tee -a "$USER_HOME/.zshrc"
+          echo '# Node.js and npm' | sudo tee -a "$USER_HOME/.zshrc"
+          echo 'export PATH="/opt/homebrew/opt/node@22/bin:$PATH"' | sudo tee -a "$USER_HOME/.zshrc"
+          echo 'export PATH="/opt/homebrew/bin:$PATH"' | sudo tee -a "$USER_HOME/.zshrc"
+          echo 'export PATH="/usr/local/bin:$PATH"' | sudo tee -a "$USER_HOME/.zshrc"
+          echo '' | sudo tee -a "$USER_HOME/.zshrc"
+          echo '# NPM global packages' | sudo tee -a "$USER_HOME/.zshrc"
+          echo 'export PATH="$HOME/.npm-global/bin:$PATH"' | sudo tee -a "$USER_HOME/.zshrc"
+          echo 'export PATH="$HOME/.local/bin:$PATH"' | sudo tee -a "$USER_HOME/.zshrc"
+          echo 'export PATH="./node_modules/.bin:$PATH"' | sudo tee -a "$USER_HOME/.zshrc"
+          echo '' | sudo tee -a "$USER_HOME/.zshrc"
+          echo '# npm config' | sudo tee -a "$USER_HOME/.zshrc"
+          echo 'export NPM_CONFIG_PREFIX="$HOME/.npm-global"' | sudo tee -a "$USER_HOME/.zshrc"
+          echo '' | sudo tee -a "$USER_HOME/.zshrc"
+          echo '# Aliases' | sudo tee -a "$USER_HOME/.zshrc"
+          echo 'alias ll="ls -la"' | sudo tee -a "$USER_HOME/.zshrc"
+          echo 'alias la="ls -A"' | sudo tee -a "$USER_HOME/.zshrc"
+          
+          # Create .bash_profile backup
+          echo '# Homebrew' | sudo tee "$USER_HOME/.bash_profile"
+          echo 'eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"' | sudo tee -a "$USER_HOME/.bash_profile"
+          echo 'export PATH="/opt/homebrew/opt/node@22/bin:$PATH"' | sudo tee -a "$USER_HOME/.bash_profile"
+          echo 'export PATH="/opt/homebrew/bin:$PATH"' | sudo tee -a "$USER_HOME/.bash_profile"
+          echo 'export PATH="$HOME/.npm-global/bin:$PATH"' | sudo tee -a "$USER_HOME/.bash_profile"
+          echo 'export NPM_CONFIG_PREFIX="$HOME/.npm-global"' | sudo tee -a "$USER_HOME/.bash_profile"
+          
+          # Create npm global directory
+          sudo mkdir -p "$USER_HOME/.npm-global" 2>/dev/null || true
+          sudo mkdir -p "$USER_HOME/.local/bin" 2>/dev/null || true
+          sudo mkdir -p "$USER_HOME/.npm" 2>/dev/null || true
+          
+          # Set ownership
+          sudo chown -R "$RDP_USER:staff" "$USER_HOME"
+          sudo chmod 755 "$USER_HOME"
+          sudo chmod 644 "$USER_HOME/.zshrc" "$USER_HOME/.bash_profile" 2>/dev/null || true
+          
+          # Give user write access to Homebrew directories
+          sudo chown -R "$RDP_USER:admin" /opt/homebrew 2>/dev/null || true
+          sudo chmod -R 775 /opt/homebrew 2>/dev/null || true
+          
+          echo ""
+          echo "============================================"
+          echo "USER CREATED WITH FULL ADMIN ACCESS"
+          echo "============================================"
+          echo "Username: $RDP_USER"
+          echo "Password: $RDP_PASS"
+          echo ""
+          echo "Groups:"
+          id "$RDP_USER"
+          echo ""
+          echo "Privileges Granted:"
+          echo "  - Admin group"
+          echo "  - Wheel group (root)"
+          echo "  - Developer group"
+          echo "  - Secure Token enabled"
+          echo "  - Passwordless sudo"
+          echo "  - Full Disk Access"
+          echo "  - Full Homebrew access"
+          echo "  - Full npm access"
+          echo "============================================"
+
+      - name: Enable macOS Screen Sharing
+        run: |
+          vnc_pass="${VNC_PASS:0:8}"
+          sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -restartopts -now -privs -all 2>/dev/null || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$vnc_pass" 2>/dev/null || true
+          sudo dscl . append /Groups/com.apple.access_screensharing groupmembership "$RDP_USER" 2>/dev/null || true
+          echo "============================================"
+          echo "macOS Screen Sharing Enabled!"
+          echo "Connect via VNC to: $TAILSCALE_IP:5900"
+          echo "VNC Password: ${VNC_PASS:0:8}"
+          echo "============================================"
+
+      - name: Install Node.js + npm packages
+        run: |
+          export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
+          node --version
+          npm --version
+          npm install -g typescript ts-node nodemon pm2 yarn pnpm
+          echo "============================================"
+          echo "Node.js Ready!"
+          echo "============================================"
+
+      - name: Install Bonsai CLI
+        env:
+          BONSAI_API_KEY: ${{ inputs.bonsai_api_key }}
+        run: |
+          export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
+          npm install -g @bonsai-ai/cli
+          if [ -n "$BONSAI_API_KEY" ]; then
+            mkdir -p ~/.bonsai
+            echo "API_KEY=$BONSAI_API_KEY" > ~/.bonsai/config
+            chmod 600 ~/.bonsai/config
+            sudo -u "$RDP_USER" mkdir -p "/Users/$RDP_USER/.bonsai" 2>/dev/null || true
+            echo "API_KEY=$BONSAI_API_KEY" | sudo tee "/Users/$RDP_USER/.bonsai/config" > /dev/null
+            sudo chmod 600 "/Users/$RDP_USER/.bonsai/config"
+            sudo chown "$RDP_USER:staff" "/Users/$RDP_USER/.bonsai/config"
+            echo "Bonsai CLI configured with API key"
+          fi
+          echo "============================================"
+          echo "Bonsai CLI Ready!"
+          echo "============================================"
+
+      - name: Install VS Code (code-server) for bulletuser
+        run: |
+          USER_HOME="/Users/$RDP_USER"
+          
+          curl -fsSL https://code-server.dev/install.sh | sh
+          
+          sudo -u "$RDP_USER" mkdir -p "$USER_HOME/.config/code-server"
+          
+          # Create config file
+          echo "bind-addr: 0.0.0.0:8080" | sudo -u "$RDP_USER" tee "$USER_HOME/.config/code-server/config.yaml"
+          echo "auth: password" | sudo -u "$RDP_USER" tee -a "$USER_HOME/.config/code-server/config.yaml"
+          echo "password: $RDP_PASS" | sudo -u "$RDP_USER" tee -a "$USER_HOME/.config/code-server/config.yaml"
+          echo "cert: false" | sudo -u "$RDP_USER" tee -a "$USER_HOME/.config/code-server/config.yaml"
+          
+          sudo -u "$RDP_USER" mkdir -p "$USER_HOME/.local/share/code-server"
+          
+          sudo chown -R "$RDP_USER:staff" "$USER_HOME/.config"
+          sudo chown -R "$RDP_USER:staff" "$USER_HOME/.local"
+          
+          echo "============================================"
+          echo "VS Code (code-server) Ready for $RDP_USER!"
+          echo "Access at: http://localhost:8080"
+          echo "Password: $RDP_PASS"
+          echo "============================================"
+
+      - name: Start Services as bulletuser
+        run: |
+          USER_HOME="/Users/$RDP_USER"
+          
+          sudo -u "$RDP_USER" -H sh -c 'source ~/.zshrc 2>/dev/null || source ~/.bash_profile 2>/dev/null; export PATH="/opt/homebrew/bin:/opt/homebrew/opt/node@22/bin:$HOME/.npm-global/bin:$PATH"; code-server --config ~/.config/code-server/config.yaml > /tmp/code-server.log 2>&1 &' || true
+          
+          sleep 2
+          
+          echo ""
+          echo "============================================"
+          echo "ALL SERVICES STARTED!"
+          echo "============================================"
+          echo ""
+          echo "CONNECTION INFO:"
+          echo "  VNC: $TAILSCALE_IP:5900"
+          echo "  VS Code: http://$TAILSCALE_IP:8080"
+          echo ""
+          echo "CREDENTIALS:"
+          echo "  Username: $RDP_USER"
+          echo "  Password: $RDP_PASS"
+          echo "  VNC Password: ${VNC_PASS:0:8}"
+          echo ""
+          echo "FULL ACCESS ENABLED:"
+          echo "  - Homebrew (brew commands work)"
+          echo "  - npm (global install works)"
+          echo "  - Passwordless sudo"
+          echo "  - Full Disk Access"
+          echo "============================================"
+
+      - name: Keep alive
+        run: |
+          end=$((SECONDS + RUNTIME_MINUTES * 60))
+          iteration=0
+          echo "Keep-alive started. Will run for $RUNTIME_MINUTES minutes"
+          while [ $SECONDS -lt $end ]; do
+            iteration=$((iteration + 1))
+            remaining=$(( (end - SECONDS) / 60 ))
+            echo "[$iteration] Alive at $(date '+%H:%M:%S') | VNC: $RDP_USER @ $TAILSCALE_IP | Remaining: $remaining min"
+            sleep 60
+          done
+          echo "Runtime completed at $(date)"
+
+      - name: Cleanup on exit
+        if: always()
+        run: |
+          echo "Cleaning up..."
+          export PATH="/opt/homebrew/bin:$PATH"
+          sudo tailscale logout 2>/dev/null || true
+          echo "Logged out from Tailscale"
+          pkill code-server 2>/dev/null || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -deactivate -stop 2>/dev/null || true
+          echo "Cleanup completed"
